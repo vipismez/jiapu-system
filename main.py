@@ -4,7 +4,7 @@
 import json
 import uuid
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -26,6 +26,7 @@ class Person:
     death: str = ""
     father: str | None = None
     mother: str | None = None
+    spouses: list[str] = field(default_factory=list)
     bio: str = ""
 
     def to_dict(self):
@@ -37,11 +38,18 @@ class Person:
             "death": self.death,
             "father": self.father,
             "mother": self.mother,
+            "spouses": self.spouses,
             "bio": self.bio,
         }
 
     @classmethod
     def from_dict(cls, data):
+        spouses = data.get("spouses")
+        if not isinstance(spouses, list):
+            # Backward compatibility with legacy single spouse field.
+            spouse = data.get("spouse")
+            spouses = [spouse] if spouse else []
+
         return cls(
             id=data.get("id", ""),
             name=data.get("name", ""),
@@ -50,6 +58,7 @@ class Person:
             death=data.get("death") or "",
             father=data.get("father"),
             mother=data.get("mother"),
+            spouses=spouses,
             bio=data.get("bio") or "",
         )
 
@@ -62,23 +71,23 @@ def save_data(members):
 def build_sample_data():
     members = {}
 
-    def add_person(person_id, name, gender, birth, death="", father=None, mother=None, bio=""):
+    def add_person(name, gender, birth, death="", father=None, mother=None, bio=""):
+        person_id = str(uuid.uuid4())
         members[person_id] = Person(person_id, name, gender, birth, death, father, mother, bio)
+        return person_id
 
-    add_person("G1F", "赵先祖", "男", "1920-01-01", "1990-01-01", bio="第1代祖先")
-    add_person("G1M", "王母祖", "女", "1925-02-02", "2000-02-02", bio="第1代祖先")
+    root_father_id = add_person("赵先祖", "男", "1920-01-01", "1990-01-01", bio="第1代祖先")
+    root_mother_id = add_person("王母祖", "女", "1925-02-02", "2000-02-02", bio="第1代祖先")
+    members[root_father_id].spouses = [root_mother_id]
+    members[root_mother_id].spouses = [root_father_id]
 
     previous_child = None
+    previous_mother = root_mother_id
     for generation in range(2, 12):
-        father_id = f"G{generation}F"
-        mother_id = f"G{generation}M"
-        child_id = f"G{generation}C"
+        parent_father = previous_child or root_father_id
+        parent_mother = previous_mother
 
-        parent_father = previous_child or "G1F"
-        parent_mother = f"G{generation - 1}M" if generation > 2 else "G1M"
-
-        add_person(
-            father_id,
+        father_id = add_person(
             f"世{generation}富",
             "男",
             f"{1940 + generation}-03-03",
@@ -86,15 +95,15 @@ def build_sample_data():
             mother=parent_mother,
             bio=f"第{generation}代男性",
         )
-        add_person(
-            mother_id,
+        mother_id = add_person(
             f"世{generation}秀",
             "女",
             f"{1940 + generation}-04-04",
             bio=f"第{generation}代配偶",
         )
-        add_person(
-            child_id,
+        members[father_id].spouses = [mother_id]
+        members[mother_id].spouses = [father_id]
+        child_id = add_person(
             f"世{generation}子",
             "男",
             f"{1960 + generation}-05-05",
@@ -103,7 +112,6 @@ def build_sample_data():
             bio=f"第{generation}代子孙",
         )
         add_person(
-            f"G{generation}S",
             f"世{generation}妹",
             "女",
             f"{1961 + generation}-08-08",
@@ -113,6 +121,7 @@ def build_sample_data():
         )
 
         previous_child = child_id
+        previous_mother = mother_id
 
     return members
 
@@ -126,6 +135,15 @@ def normalize_members(members):
         if person.mother == person.id:
             person.mother = None
             changed = True
+        normalized_spouses = []
+        seen = set()
+        for spouse_id in person.spouses:
+            if spouse_id == person.id or spouse_id in seen:
+                changed = True
+                continue
+            seen.add(spouse_id)
+            normalized_spouses.append(spouse_id)
+        person.spouses = normalized_spouses
     return changed
 
 
@@ -160,6 +178,14 @@ class GenealogyApp:
         self.current_hover_id = None
         self.node_positions = {}
         self.scale_factor = 1.0
+        self._dragging = False
+        self._press_x = 0
+        self._press_y = 0
+        self._drag_node_id = None
+        self._pan_mode = False
+        self._current_center_person = None
+        self._current_siblings = []
+        self._current_spouse = None
 
         roots = self.get_roots()
         if roots:
@@ -184,9 +210,10 @@ class GenealogyApp:
         self.canvas.bind("<Motion>", self.on_canvas_motion)
         self.canvas.bind("<Leave>", self.on_canvas_leave)
         self.canvas.bind("<Button-3>", self.on_canvas_right_click)
-        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_left_click)
-        self.canvas.bind("<ButtonPress-1>", self.on_pan_start)
-        self.canvas.bind("<B1-Motion>", self.on_pan_move)
+        self.canvas.bind("<ButtonPress-1>", self.on_left_press)
+        self.canvas.bind("<B1-Motion>", self.on_left_motion)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
+        self.canvas.bind("<Double-Button-1>", self.on_canvas_left_click)
         self.canvas.bind("<MouseWheel>", self.on_zoom)
         self.canvas.bind("<Button-4>", lambda event: self.zoom_at(event.x, event.y, 1.1))
         self.canvas.bind("<Button-5>", lambda event: self.zoom_at(event.x, event.y, 0.9))
@@ -276,27 +303,61 @@ class GenealogyApp:
         self.node_positions = {}
         self.scale_factor = 1.0
 
-        ancestor_levels = self.get_ancestor_levels(root_person, max_level=3)
-        descendant_levels = self.get_descendant_levels(root_person, max_level=3)
+        father = self.members.get(root_person.father) if root_person.father in self.members else None
+        mother = self.members.get(root_person.mother) if root_person.mother in self.members else None
+        spouses = [self.members[sid] for sid in root_person.spouses if sid in self.members and sid != root_person.id]
         siblings = self.get_siblings(root_person)
+        children = self.get_children(root_person.id)
+
         center_x = CANVAS_WIDTH / 2
         center_y = CANVAS_HEIGHT / 2
 
-        for index, level in enumerate(reversed(ancestor_levels), start=1):
-            y = center_y - LAYER_HEIGHT * index
-            self.draw_level(level, y, "anc", center_person=root_person)
+        self.canvas.create_text(center_x, center_y - LAYER_HEIGHT - 42, text="父母", fill="#64748b", font=(None, 10), tags=("graph",))
+        self.canvas.create_text(center_x, center_y - 42, text="本人 / 兄弟姐妹 / 配偶", fill="#64748b", font=(None, 10), tags=("graph",))
+        self.canvas.create_text(center_x, center_y + LAYER_HEIGHT - 42, text="子女", fill="#64748b", font=(None, 10), tags=("graph",))
 
-        self.draw_node(center_x, center_y, root_person, "center")
+        # 上层：父母
+        parent_nodes = [p for p in (father, mother) if p is not None]
+        if parent_nodes:
+            parent_y = center_y - LAYER_HEIGHT
+            parent_count = len(parent_nodes)
+            parent_width = parent_count * NODE_WIDTH + max(0, parent_count - 1) * HORIZONTAL_GAP
+            parent_start_x = center_x - parent_width / 2 + NODE_WIDTH / 2
+            for index, person in enumerate(parent_nodes):
+                px = parent_start_x + index * (NODE_WIDTH + HORIZONTAL_GAP)
+                self.draw_node(px, parent_y, person, "anc")
 
-        if siblings:
-            sibling_y = center_y
-            self.draw_same_row_group(root_person, siblings, sibling_y)
+        # 中层：兄弟姐妹 + 本人 + 配偶（按顺序横向排布）
+        same_row = siblings + [root_person]
+        same_row.extend(spouses)
 
-        for index, level in enumerate(descendant_levels, start=1):
-            y = center_y + LAYER_HEIGHT * index
-            self.draw_level(level, y, "chd", center_person=root_person)
+        same_row = self.order_level_members(same_row, center_person=root_person)
+        row_count = len(same_row)
+        row_width = row_count * NODE_WIDTH + max(0, row_count - 1) * HORIZONTAL_GAP
+        row_start_x = center_x - row_width / 2 + NODE_WIDTH / 2
+        for index, person in enumerate(same_row):
+            px = row_start_x + index * (NODE_WIDTH + HORIZONTAL_GAP)
+            prefix = "center" if person.id == root_person.id else "sib"
+            if person.id in {s.id for s in spouses}:
+                prefix = "spouse"
+            self.draw_node(px, center_y, person, prefix)
 
-        self.draw_relationships(root_person, siblings)
+        # 下层：子女
+        if children:
+            child_y = center_y + LAYER_HEIGHT
+            ordered_children = self.order_level_members(children, center_person=root_person)
+            child_count = len(ordered_children)
+            child_width = child_count * NODE_WIDTH + max(0, child_count - 1) * HORIZONTAL_GAP
+            child_start_x = center_x - child_width / 2 + NODE_WIDTH / 2
+            for index, person in enumerate(ordered_children):
+                px = child_start_x + index * (NODE_WIDTH + HORIZONTAL_GAP)
+                self.draw_node(px, child_y, person, "chd")
+
+        self._current_center_person = root_person
+        self._current_siblings = siblings
+        self._current_spouse = spouses
+        self.draw_relationships(root_person, siblings, spouses)
+        self.draw_legend()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
     def draw_level(self, members, y, prefix, center_person=None):
@@ -363,13 +424,15 @@ class GenealogyApp:
         )
         self.node_positions[person.id] = (x, y)
 
-    def draw_relationships(self, center_person, siblings):
+    def draw_relationships(self, center_person, siblings, spouses=None):
+        # Clear previous relationship edges/labels to avoid ghosting during drag.
+        self.canvas.delete("relation")
         drawn = set()
 
-        def add_line(from_id, to_id, label):
+        def add_parent_child_line(from_id, to_id):
             if from_id not in self.node_positions or to_id not in self.node_positions:
                 return
-            key = (from_id, to_id, label)
+            key = (from_id, to_id, "pc")
             if key in drawn:
                 return
             drawn.add(key)
@@ -382,33 +445,103 @@ class GenealogyApp:
                 x1,
                 y1 - NODE_HEIGHT / 2 + 4,
                 arrow=tk.LAST,
-                width=1.2,
-                fill="#1f2937",
-                tags=("graph",),
-            )
-            self.canvas.create_text(
-                (x0 + x1) / 2,
-                (y0 + y1) / 2 - 10,
-                text=label,
-                fill="#b91c1c",
-                font=(None, 9),
-                tags=("graph",),
+                width=3,
+                fill="#dc2626",
+                tags=("graph", "relation"),
             )
 
         for person_id, person in self.members.items():
             if person_id not in self.node_positions:
                 continue
             if person.father:
-                add_line(person.father, person_id, "父")
+                add_parent_child_line(person.father, person_id)
             if person.mother:
-                add_line(person.mother, person_id, "母")
+                add_parent_child_line(person.mother, person_id)
 
         for sibling in siblings:
             if sibling.id in self.node_positions and center_person.id in self.node_positions:
                 x0, y0 = self.node_positions[center_person.id]
                 x1, y1 = self.node_positions[sibling.id]
-                self.canvas.create_line(x0, y0, x1, y1, dash=(3, 2), fill="#64748b", tags=("graph",))
-                self.canvas.create_text((x0 + x1) / 2, y0 - 18, text="兄妹", fill="#b91c1c", font=(None, 9), tags=("graph",))
+                self.canvas.create_line(
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    width=3,
+                    fill="#facc15",
+                    tags=("graph", "relation"),
+                )
+
+        for spouse in (spouses or []):
+            if spouse.id in self.node_positions and center_person.id in self.node_positions:
+                x0, y0 = self.node_positions[center_person.id]
+                x1, y1 = self.node_positions[spouse.id]
+                self.canvas.create_line(
+                    x0,
+                    y0 + 8,
+                    x1,
+                    y1 + 8,
+                    dash=(8, 4),
+                    width=3,
+                    fill="#2563eb",
+                    tags=("graph", "relation"),
+                )
+
+    def draw_legend(self):
+        # Legend for relation styles in the top-left corner.
+        x0 = 18
+        y0 = 16
+        width = 250
+        height = 120
+        self.canvas.create_rectangle(
+            x0,
+            y0,
+            x0 + width,
+            y0 + height,
+            fill="#ffffff",
+            outline="#cbd5e1",
+            width=1,
+            tags=("graph", "legend"),
+        )
+        self.canvas.create_text(
+            x0 + 10,
+            y0 + 14,
+            text="线条图例",
+            anchor=tk.W,
+            fill="#334155",
+            font=(None, 10, "bold"),
+            tags=("graph", "legend"),
+        )
+
+        rows = [
+            ("父母/子女", "#dc2626", False, True),
+            ("配偶", "#2563eb", True, False),
+            ("兄弟姐妹", "#facc15", False, False),
+        ]
+
+        start_y = y0 + 36
+        for idx, (label, color, dashed, arrowed) in enumerate(rows):
+            y = start_y + idx * 26
+            kwargs = {
+                "fill": color,
+                "width": 3,
+                "tags": ("graph", "legend"),
+            }
+            if dashed:
+                kwargs["dash"] = (8, 4)
+            if arrowed:
+                kwargs["arrow"] = tk.LAST
+
+            self.canvas.create_line(x0 + 12, y, x0 + 72, y, **kwargs)
+            self.canvas.create_text(
+                x0 + 82,
+                y,
+                text=label,
+                anchor=tk.W,
+                fill="#0f172a",
+                font=(None, 9),
+                tags=("graph", "legend"),
+            )
 
     def on_canvas_right_click(self, event):
         person_id = self.find_person_at(event.x, event.y)
@@ -427,26 +560,85 @@ class GenealogyApp:
         menu.post(event.x_root, event.y_root)
 
     def on_canvas_left_click(self, event):
+        if self._dragging:
+            return
         person_id = self.find_person_at(event.x, event.y)
         if not person_id or person_id not in self.members:
             return
         self.set_center(person_id)
 
+    def on_left_press(self, event):
+        self._dragging = False
+        self._press_x = event.x
+        self._press_y = event.y
+
+        person_id = self.find_person_at(event.x, event.y)
+        if person_id and person_id in self.members:
+            self._drag_node_id = person_id
+            self._pan_mode = False
+        else:
+            self._drag_node_id = None
+            self._pan_mode = True
+            self.canvas.scan_mark(event.x, event.y)
+
+    def on_left_motion(self, event):
+        if self._drag_node_id:
+            dx = event.x - self._press_x
+            dy = event.y - self._press_y
+            if dx == 0 and dy == 0:
+                return
+
+            if abs(dx) > 1 or abs(dy) > 1:
+                self._dragging = True
+
+            self.canvas.move(f"node_{self._drag_node_id}", dx, dy)
+            x, y = self.node_positions.get(self._drag_node_id, (0, 0))
+            self.node_positions[self._drag_node_id] = (x + dx, y + dy)
+            self._press_x = event.x
+            self._press_y = event.y
+
+            if self._current_center_person is not None:
+                self.draw_relationships(self._current_center_person, self._current_siblings, self._current_spouse)
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            return
+
+        if self._pan_mode:
+            if abs(event.x - self._press_x) > 3 or abs(event.y - self._press_y) > 3:
+                self._dragging = True
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def on_left_release(self, event):
+        if self._dragging:
+            self._drag_node_id = None
+            self._pan_mode = False
+            return
+
+        person_id = self.find_person_at(event.x, event.y)
+        if person_id and person_id in self.members:
+            self.current_hover_id = person_id
+            self.show_tooltip(person_id, event.x_root + 14, event.y_root + 14)
+        else:
+            self.hide_tooltip()
+
+        self._drag_node_id = None
+        self._pan_mode = False
+
     def find_person_at(self, x, y):
-        for item in self.canvas.find_overlapping(x, y, x, y):
+        cx = self.canvas.canvasx(x)
+        cy = self.canvas.canvasy(y)
+        for item in self.canvas.find_overlapping(cx, cy, cx, cy):
             for tag in self.canvas.gettags(item):
                 if tag.startswith("node_"):
                     return tag.split("node_", 1)[1]
         return None
 
     def on_canvas_motion(self, event):
-        person_id = self.find_person_at(event.x, event.y)
-        if person_id and person_id in self.members:
-            if self.current_hover_id != person_id:
-                self.current_hover_id = person_id
-                self.show_tooltip(person_id, event.x_root + 14, event.y_root + 14)
+        if self.current_hover_id is None:
             return
-        self.hide_tooltip()
+
+        person_id = self.find_person_at(event.x, event.y)
+        if person_id != self.current_hover_id:
+            self.hide_tooltip()
 
     def on_canvas_leave(self, _event):
         self.hide_tooltip()
@@ -459,6 +651,7 @@ class GenealogyApp:
 
         father_name = self.members[person.father].name if person.father and person.father in self.members else "未知"
         mother_name = self.members[person.mother].name if person.mother and person.mother in self.members else "未知"
+        spouse_names = [self.members[sid].name for sid in person.spouses if sid in self.members]
         text = (
             f"姓名：{person.name}\n"
             f"性别：{person.gender}\n"
@@ -466,6 +659,7 @@ class GenealogyApp:
             f"卒日：{person.death or '未去世'}\n"
             f"父亲：{father_name}\n"
             f"母亲：{mother_name}\n"
+            f"配偶：{', '.join(spouse_names) if spouse_names else '无'}\n"
             f"生平：{person.bio or '无'}"
         )
 
@@ -490,14 +684,10 @@ class GenealogyApp:
             self.tooltip = None
         self.current_hover_id = None
 
-    def on_pan_start(self, event):
-        self.canvas.scan_mark(event.x, event.y)
-
-    def on_pan_move(self, event):
-        self.canvas.scan_dragto(event.x, event.y, gain=1)
-
     def zoom_at(self, x, y, factor):
-        self.canvas.scale("graph", x, y, factor, factor)
+        cx = self.canvas.canvasx(x)
+        cy = self.canvas.canvasy(y)
+        self.canvas.scale("graph", cx, cy, factor, factor)
         self.scale_factor *= factor
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
@@ -514,62 +704,247 @@ class GenealogyApp:
         self.selected_member_id = roots[0].id if roots else None
         self.refresh_view()
 
+    def person_option(self, person_id):
+        person = self.members.get(person_id)
+        if not person:
+            return person_id
+        return f"{person.name} ({person.gender}) | {person_id}"
+
+    def resolve_person_id(self, value):
+        value = (value or "").strip()
+        if not value:
+            return None
+        if value in self.members:
+            return value
+        if "|" in value:
+            possible_id = value.split("|")[-1].strip()
+            if possible_id in self.members:
+                return possible_id
+        return None
+
+    def add_spouse_link(self, person_id, spouse_id):
+        if not person_id or not spouse_id:
+            return
+        if person_id == spouse_id:
+            return
+        if person_id not in self.members or spouse_id not in self.members:
+            return
+
+        if spouse_id not in self.members[person_id].spouses:
+            self.members[person_id].spouses.append(spouse_id)
+        if person_id not in self.members[spouse_id].spouses:
+            self.members[spouse_id].spouses.append(person_id)
+
+    def set_spouse_links(self, person_id, spouse_ids):
+        if person_id not in self.members:
+            return
+        current = set(self.members[person_id].spouses)
+        target = {sid for sid in spouse_ids if sid in self.members and sid != person_id}
+
+        for sid in list(current - target):
+            if sid in self.members and person_id in self.members[sid].spouses:
+                self.members[sid].spouses.remove(person_id)
+
+        self.members[person_id].spouses = []
+        for sid in target:
+            self.add_spouse_link(person_id, sid)
+
+    def get_primary_spouse_id(self, person):
+        for sid in person.spouses:
+            if sid in self.members:
+                return sid
+        return None
+
+    def apply_sibling_links(self, person_id, sibling_ids):
+        if person_id not in self.members:
+            return
+        person = self.members[person_id]
+        for sid in sibling_ids:
+            if sid == person_id or sid not in self.members:
+                continue
+            sibling = self.members[sid]
+
+            if person.father and not sibling.father:
+                sibling.father = person.father
+            if person.mother and not sibling.mother:
+                sibling.mother = person.mother
+            if sibling.father and not person.father:
+                person.father = sibling.father
+            if sibling.mother and not person.mother:
+                person.mother = sibling.mother
+
     def open_member_dialog(self, role=None, target_id=None):
         dialog = tk.Toplevel(self.root)
         dialog.title("编辑人物" if role == "edit" else "新增人物")
         dialog.grab_set()
 
-        entries = {}
-        fields = [
-            ("姓名", "name"),
-            ("性别", "gender"),
-            ("生日", "birth"),
-            ("卒日", "death"),
-            ("生平简介", "bio"),
-        ]
+        editing_person = self.members.get(target_id) if role == "edit" else None
+        excluded_id = editing_person.id if editing_person else None
 
-        for row, (label_text, key) in enumerate(fields):
+        candidate_ids = [pid for pid in self.members.keys() if pid != excluded_id]
+        candidate_labels = {pid: self.person_option(pid) for pid in candidate_ids}
+
+        ttk.Label(dialog, text="姓名").grid(row=0, column=0, sticky=tk.W, padx=6, pady=6)
+        name_entry = ttk.Entry(dialog, width=40)
+        name_entry.grid(row=0, column=1, padx=6, pady=6)
+
+        ttk.Label(dialog, text="性别").grid(row=1, column=0, sticky=tk.W, padx=6, pady=6)
+        gender_combo = ttk.Combobox(dialog, values=["男", "女"], state="readonly", width=37)
+        gender_combo.grid(row=1, column=1, padx=6, pady=6)
+        gender_combo.set("男")
+
+        ttk.Label(dialog, text="生日").grid(row=2, column=0, sticky=tk.W, padx=6, pady=6)
+        birth_entry = ttk.Entry(dialog, width=40)
+        birth_entry.grid(row=2, column=1, padx=6, pady=6)
+
+        ttk.Label(dialog, text="卒日").grid(row=3, column=0, sticky=tk.W, padx=6, pady=6)
+        death_entry = ttk.Entry(dialog, width=40)
+        death_entry.grid(row=3, column=1, padx=6, pady=6)
+
+        def build_searchable_combo(row, label_text):
             ttk.Label(dialog, text=label_text).grid(row=row, column=0, sticky=tk.W, padx=6, pady=6)
-            entry = ttk.Entry(dialog, width=40)
-            entry.grid(row=row, column=1, padx=6, pady=6)
-            entries[key] = entry
+            combo = ttk.Combobox(dialog, width=37)
+            combo.grid(row=row, column=1, padx=6, pady=6)
 
-        if role == "edit" and target_id in self.members:
-            person = self.members[target_id]
-            entries["name"].insert(0, person.name)
-            entries["gender"].insert(0, person.gender)
-            entries["birth"].insert(0, person.birth)
-            entries["death"].insert(0, person.death)
-            entries["bio"].insert(0, person.bio)
+            def refresh_options(_event=None):
+                term = combo.get().strip().lower()
+                options = [lbl for _, lbl in candidate_labels.items() if term in lbl.lower()]
+                combo["values"] = options
+
+            combo.bind("<KeyRelease>", refresh_options)
+            combo["values"] = list(candidate_labels.values())
+            return combo
+
+        father_combo = build_searchable_combo(4, "父亲")
+        mother_combo = build_searchable_combo(5, "母亲")
+
+        ttk.Label(dialog, text="配偶(逐个添加)").grid(row=6, column=0, sticky=tk.NW, padx=6, pady=6)
+        spouse_frame = ttk.Frame(dialog)
+        spouse_frame.grid(row=6, column=1, sticky=tk.W, padx=6, pady=6)
+
+        ttk.Label(dialog, text="兄弟姐妹(逐个添加)").grid(row=7, column=0, sticky=tk.NW, padx=6, pady=6)
+        sibling_frame = ttk.Frame(dialog)
+        sibling_frame.grid(row=7, column=1, sticky=tk.W, padx=6, pady=6)
+
+        ttk.Label(dialog, text="生平简介").grid(row=8, column=0, sticky=tk.W, padx=6, pady=6)
+        bio_entry = ttk.Entry(dialog, width=40)
+        bio_entry.grid(row=8, column=1, padx=6, pady=6)
+
+        existing_spouses = editing_person.spouses[:] if editing_person else []
+        existing_siblings = [p.id for p in self.get_siblings(editing_person)] if editing_person else []
+
+        def build_incremental_selector(parent_frame, initial_ids):
+            selected_ids = [pid for pid in initial_ids if pid in candidate_labels]
+
+            search_combo = ttk.Combobox(parent_frame, width=40)
+            search_combo.pack(fill=tk.X)
+            search_combo["values"] = list(candidate_labels.values())
+
+            btn_row = ttk.Frame(parent_frame)
+            btn_row.pack(fill=tk.X, pady=(4, 4))
+            selected_list = tk.Listbox(parent_frame, selectmode=tk.SINGLE, width=52, height=5)
+            selected_list.pack(fill=tk.BOTH)
+
+            def refresh_selected_list():
+                selected_list.delete(0, tk.END)
+                for pid in selected_ids:
+                    selected_list.insert(tk.END, candidate_labels[pid])
+
+            def refresh_search_values(_event=None):
+                term = search_combo.get().strip().lower()
+                options = [lbl for lbl in candidate_labels.values() if term in lbl.lower()]
+                search_combo["values"] = options
+
+            def add_selected():
+                pid = self.resolve_person_id(search_combo.get())
+                if not pid or pid not in candidate_labels:
+                    return
+                if pid not in selected_ids:
+                    selected_ids.append(pid)
+                    refresh_selected_list()
+                search_combo.set("")
+
+            def remove_selected():
+                idx = selected_list.curselection()
+                if not idx:
+                    return
+                del selected_ids[idx[0]]
+                refresh_selected_list()
+
+            ttk.Button(btn_row, text="添加", command=add_selected).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Button(btn_row, text="移除", command=remove_selected).pack(side=tk.LEFT)
+
+            search_combo.bind("<KeyRelease>", refresh_search_values)
+            refresh_selected_list()
+
+            return lambda: list(selected_ids)
+
+        get_spouse_ids = build_incremental_selector(spouse_frame, existing_spouses)
+        get_sibling_ids = build_incremental_selector(sibling_frame, existing_siblings)
+
+        if editing_person:
+            name_entry.insert(0, editing_person.name)
+            gender_combo.set(editing_person.gender if editing_person.gender in ("男", "女") else "男")
+            birth_entry.insert(0, editing_person.birth)
+            death_entry.insert(0, editing_person.death)
+            bio_entry.insert(0, editing_person.bio)
+            if editing_person.father and editing_person.father in candidate_labels:
+                father_combo.set(candidate_labels[editing_person.father])
+            if editing_person.mother and editing_person.mother in candidate_labels:
+                mother_combo.set(candidate_labels[editing_person.mother])
 
         def on_submit():
-            name = entries["name"].get().strip()
-            gender = entries["gender"].get().strip()
-            if not name or not gender:
-                messagebox.showwarning("缺少必填", "姓名和性别为必填项目")
+            name = name_entry.get().strip()
+            gender = gender_combo.get().strip()
+            if not name:
+                messagebox.showwarning("缺少必填", "姓名为必填项目")
+                return
+            if gender not in ("男", "女"):
+                messagebox.showwarning("性别无效", "性别只能选择 男 或 女")
                 return
 
-            birth = entries["birth"].get().strip()
-            death = entries["death"].get().strip()
-            bio = entries["bio"].get().strip()
+            father_id = self.resolve_person_id(father_combo.get())
+            mother_id = self.resolve_person_id(mother_combo.get())
+            if father_combo.get().strip() and not father_id:
+                messagebox.showwarning("父亲无效", "父亲选择无效，请按姓名检索后选择")
+                return
+            if mother_combo.get().strip() and not mother_id:
+                messagebox.showwarning("母亲无效", "母亲选择无效，请按姓名检索后选择")
+                return
 
-            if role == "edit" and target_id in self.members:
-                person = self.members[target_id]
+            spouse_ids = get_spouse_ids()
+            sibling_ids = get_sibling_ids()
+
+            birth = birth_entry.get().strip()
+            death = death_entry.get().strip()
+            bio = bio_entry.get().strip()
+
+            if editing_person:
+                person = editing_person
                 person.name = name
                 person.gender = gender
                 person.birth = birth
                 person.death = death
                 person.bio = bio
+                person.father = father_id
+                person.mother = mother_id
+                self.set_spouse_links(person.id, spouse_ids)
+                self.apply_sibling_links(person.id, sibling_ids)
             else:
-                new_person = Person(str(uuid.uuid4()), name, gender, birth, death, bio=bio)
-                self.attach_relationship(new_person, role, target_id)
-                self.members[new_person.id] = new_person
+                person = Person(str(uuid.uuid4()), name, gender, birth, death, father=father_id, mother=mother_id, bio=bio)
+                self.members[person.id] = person
+                self.attach_relationship(person, role, target_id)
+                self.set_spouse_links(person.id, spouse_ids)
+                self.apply_sibling_links(person.id, sibling_ids)
+
+            if person.father and person.mother:
+                self.add_spouse_link(person.father, person.mother)
 
             self.save_and_refresh()
             dialog.destroy()
 
         button_row = ttk.Frame(dialog)
-        button_row.grid(row=len(fields), column=0, columnspan=2, pady=(6, 10))
+        button_row.grid(row=9, column=0, columnspan=2, pady=(6, 10))
         ttk.Button(button_row, text="确认", command=on_submit).pack(side=tk.LEFT, padx=4)
         ttk.Button(button_row, text="取消", command=dialog.destroy).pack(side=tk.LEFT, padx=4)
 
@@ -577,18 +952,25 @@ class GenealogyApp:
         target = self.members.get(target_id)
         if role == "father" and target:
             target.father = person.id
+            if target.mother and target.mother in self.members:
+                self.add_spouse_link(person.id, target.mother)
         elif role == "mother" and target:
             target.mother = person.id
+            if target.father and target.father in self.members:
+                self.add_spouse_link(person.id, target.father)
         elif role == "child" and target:
+            # 子女父母应由“当前节点及其配偶”决定，不能继承当前节点的上一代父母。
+            spouse_id = self.get_primary_spouse_id(target)
             if target.gender in ("男", "男性", "male"):
-                person.father = target.id
-                person.mother = target.mother
+                if not person.father:
+                    person.father = target.id
+                if not person.mother:
+                    person.mother = spouse_id
             elif target.gender in ("女", "女性", "female"):
-                person.mother = target.id
-                person.father = target.father
-            else:
-                person.father = target.father
-                person.mother = target.mother
+                if not person.mother:
+                    person.mother = target.id
+                if not person.father:
+                    person.father = spouse_id
 
     def collect_descendants(self, person_id, collected):
         for child in self.get_children(person_id):
@@ -613,6 +995,7 @@ class GenealogyApp:
                 person.father = None
             if person.mother in to_delete:
                 person.mother = None
+            person.spouses = [sid for sid in person.spouses if sid not in to_delete]
 
         if self.selected_member_id in to_delete:
             roots = self.get_roots()
