@@ -45,8 +45,8 @@
       "gender": "女",
       "birth": "1947-09-18",
       "death": "",
-      "father": "e462ab6c-f56c-4c7a-b7a5-ba1349642be9",
-      "mother": "31b1e3a2-53dc-41ce-8d8c-7f3fea5ffa54",
+      "father": null,
+      "mother": null,
       "spouses": [
         "f6ad3aea-6050-4277-b609-9c0e4107450b"
       ],
@@ -58,8 +58,8 @@
       "gender": "男",
       "birth": "1950-11-05",
       "death": "",
-      "father": "e462ab6c-f56c-4c7a-b7a5-ba1349642be9",
-      "mother": "31b1e3a2-53dc-41ce-8d8c-7f3fea5ffa54",
+      "father": null,
+      "mother": null,
       "spouses": [
         "06deb9bd-a7b2-418b-8326-b05c5f0df068"
       ],
@@ -186,8 +186,8 @@
       "gender": "女",
       "birth": "1977-02-17",
       "death": "",
-      "father": "b8bac76f-9f68-4004-a94c-808b0ce458bf",
-      "mother": "06deb9bd-a7b2-418b-8326-b05c5f0df068",
+      "father": null,
+      "mother": null,
       "spouses": [
         "b1a287b4-d025-497b-8aaf-c241d1c55f84"
       ],
